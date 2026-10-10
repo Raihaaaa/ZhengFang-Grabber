@@ -63,8 +63,7 @@ python run.py
 ```
 首次运行会自动生成 `config.json`（字段说明见下文，也可以先复制仓库里的
 `config.example.json` 作为模板）。**它保存你的教务地址、学号与密码，属于私有
-文件** —— 仓库的 `.gitignore` 已经把 `config.json` 与 `wishlist.json` 排除，
-不会被提交，请勿手动 `git add -f` 上去。
+文件**
 
 > 依赖只有一个 `requests`。RSA 加密由项目内的 `pkcs1.py` 用**纯 Python** 实现，
 > 不需要 `pycryptodome`、不需要 VC 运行库、不需要任何原生扩展 —— 打包成 exe 后
@@ -83,13 +82,10 @@ python build.py
 
 > 单文件版方便转发，但**每次启动都要把运行时解压到系统临时目录**，
 > 少数安全软件（实测火绒）会拦这一步并报
-> `Could not create the temporary directory`。遇到就换成**文件夹版**
-> （整个文件夹一起拷贝，直接双击里面的 exe），或把 exe 加入信任区。
+> `Could not create the temporary directory`
+> 解决方法：把 exe 加入信任区。
 
-> **发布包不入库**：`dist/`（单文件 exe、文件夹版与 zip）已在 `.gitignore`
-> 中排除，仓库只保留源码。需要分发时在本地执行 `python build.py`，
-> 再把产物作为 GitHub Release 的附件上传即可。
->
+
 > `build.py` 会固定 `PYTHONHASHSEED=0` 并在失败时自动重试 3 次。PyInstaller 的
 > 分析阶段对模块遍历顺序敏感，放任哈希随机时同一个命令会**时好时坏**
 > （实测报过 `TypeError`、`SystemError: Unmatched paren in format`、
@@ -224,6 +220,6 @@ zhengfang-grabber/
 └── wishlist.json      志愿列表，运行后自动生成
 ```
 ## 注意事项
-这只是一个工具，不保证百分百抢到课，软件bug我也一概不知，恳请您在遇到bug时提交issues或者通过peo67i@163.com联系我，谢谢
+这只是一个工具，不保证百分百抢到课，软件在我自己尝试中并未出现bug，恳请您在遇到bug时提交issues或者通过peo67i@163.com联系我，谢谢
 
 ## 如果帮到了您请给我点个star，这对我很有帮助，谢谢！！！
