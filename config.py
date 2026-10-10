@@ -67,7 +67,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "kklxdm_candidates": ["10", "16", "11", "12", "13"],  # 自动扫描的课程类型
 
     # ---------------- 抢课行为 ----------------
-    "poll_interval": 1.2,      # 轮询间隔（秒），建议 >= 1.0 免得被风控
+    "poll_interval": 1.5,      # 轮询间隔（秒），建议 >= 1.0 免得被风控
     "monitor_interval": 0,     # 同一门课两次刷新间隔（秒），0=每轮都刷
     "request_timeout": 8,      # 单次请求超时（秒）
     "max_retries": 3,          # 网络错误重试次数
