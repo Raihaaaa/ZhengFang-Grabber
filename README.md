@@ -183,7 +183,7 @@ python tests/live_check.py
 | `bh_id` | 班级号 | 如 `23195101`，可从学号截取 |
 | `xkkz_id_<kklxdm>` | 选课轮次标识 | 每种课程类型一个；自动探测后写入，也可手工填 `xkkz_id_10` |
 | `xkkz_id_auto` | 选课轮次标识（通用） | 界面提取功能写入，各课程类型共用时的兜底值 |
-| `poll_interval` | 全局轮询间隔（秒） | 默认 `1.2`，**不建议低于 1.0** |
+| `poll_interval` | 全局轮询间隔（秒） | 默认 `1.5`，**不建议低于 1.2** |
 | `monitor_interval` | 单课刷新间隔（秒） | `0` = 每轮都刷 |
 | `concurrent_submit` | 并发提交线程数 | 默认 `1`，调高会增加服务器压力 |
 | `start_time` | 定时开抢时间 | `YYYY-MM-DD HH:MM:SS`，留空立即开始 |
