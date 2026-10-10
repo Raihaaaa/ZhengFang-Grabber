@@ -1,0 +1,18 @@
+# 用户私有数据：真实账号密码 / 选课数据，禁止提交
+config.json
+config.json.bak
+wishlist.json
+
+# 构建产物
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 日志与临时文件
+*.log
+*.tmp
