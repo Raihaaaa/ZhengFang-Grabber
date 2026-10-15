@@ -33,6 +33,25 @@ ICON = "app.ico"  # 可选，存在则使用
 ATTEMPTS = 5      # PyInstaller 分析阶段偶发崩溃（0xC0000005），失败就重试
 
 
+def _clear_pycache() -> None:
+    """构建前删掉所有 `__pycache__`。
+
+    PyInstaller 的分析阶段会读 `.pyc`；实测**陈旧或被污染的 `__pycache__`** 会让它抛
+    `TypeError: required field "id" missing from Name` /
+    `SystemError: Unmatched paren in format` / 0xC0000005 访问冲突，
+    而且重试多少次都一样 —— 清掉缓存后立刻正常。所以每次构建（含重试）前先清一次。
+    """
+    removed = 0
+    for root, dirs, _files in os.walk("."):
+        for d in list(dirs):
+            if d == "__pycache__":
+                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                dirs.remove(d)
+                removed += 1
+    if removed:
+        print(f"已清理 {removed} 个 __pycache__ 目录")
+
+
 def build(onefile: bool) -> int:
     """跑一次 PyInstaller；onefile=False 时产出文件夹版。"""
     name = APP_NAME if onefile else DIR_BUILD_NAME
@@ -60,6 +79,7 @@ def build(onefile: bool) -> int:
     print("执行：", " ".join(args))
     result = 1
     for attempt in range(1, ATTEMPTS + 1):
+        _clear_pycache()
         if attempt > 1:
             print(f"\n第 {attempt} 次重试…")
         result = subprocess.call(args, env=env)

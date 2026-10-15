@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def check_dependencies() -> bool:

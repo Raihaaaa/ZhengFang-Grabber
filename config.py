@@ -25,6 +25,15 @@ CONFIG_PATH = os.path.join(app_dir(), "config.json")
 DEFAULT_CONFIG: Dict[str, Any] = {
     # ---------------- 账号 ----------------
     "base_url": "https://jwglxt.example.edu.cn",   # 教务系统根地址，末尾不要带 /
+    # 教务系统挂在网站子路径时的前缀。取值语义：
+    #   "auto"（默认） = 自动探测（探测结果会立刻写回配置，下次直接复用）
+    #   ""            = 明确表示挂在根目录（没有 /jwglxt）
+    #   "/xxx"        = 明确指定子路径（多数新正方是 "/jwglxt"）
+    # 有的学校（如 https://jwxt.example.edu.cn/xtgl/login_slogin.html）就在根目录，
+    # 探测到就是空串 —— 所以"留空"和"自动"必须是两个不同的值，不能混用。
+    "app_prefix": "auto",
+    # 记下 app_prefix 是给哪个域名探出来的；base_url 一变就自动作废、重新探测。
+    "app_prefix_for": "",
     "username": "",                                  # 学号
     "password": "",                                  # 密码
     "remember_password": True,
@@ -67,7 +76,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "kklxdm_candidates": ["10", "16", "11", "12", "13"],  # 自动扫描的课程类型
 
     # ---------------- 抢课行为 ----------------
-    "poll_interval": 1.5,      # 轮询间隔（秒），建议 >= 1.0 免得被风控
+    "poll_interval": 1.2,      # 轮询间隔（秒），建议 >= 1.0 免得被风控
     "monitor_interval": 0,     # 同一门课两次刷新间隔（秒），0=每轮都刷
     "request_timeout": 8,      # 单次请求超时（秒）
     "max_retries": 3,          # 网络错误重试次数

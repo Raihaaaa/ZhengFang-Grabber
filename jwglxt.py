@@ -26,6 +26,7 @@ import threading
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -54,6 +55,17 @@ class LoginError(JwglxtError):
 
 class SessionExpired(JwglxtError):
     """会话失效，需要重新登录。"""
+
+
+class PrefixMismatch(JwglxtError):
+    """请求被退回登录页 / 返回的不是数据 —— 多半是应用前缀（/jwglxt）不对。
+
+    挂在根目录的新版正方（登录页形如 `https://jwxt.xxx.edu.cn/xtgl/login_slogin.html`）
+    如果仍按 `/jwglxt/...` 去请求，服务端**不会回 404**，而是把请求退回到登录页：
+    普通表单头下是 `302 -> /xtgl/login_slogin.html`，带 `X-Requested-With` 的 XHR 头
+    下甚至是 `HTTP 901` + 空响应。这个异常专门用来触发「重新探测前缀 + 重试一次」，
+    避免历史配置里手工写过的 `/jwglxt` 把用户永久卡死。
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -103,12 +115,44 @@ class JwglxtClient:
     STAGE_CHECK = "/jwglxt/xsxk/zzxkyzb_xkZzxkyzbQuickly.html"
     STAGE_PROBE_ID = "__ZFG_STAGE_PROBE__"
 
+    # 登录页 GET / 登录 POST 用的浏览器式请求头。
+    # 会话默认头里带 `X-Requested-With: XMLHttpRequest` 与 `Accept: application/json`，
+    # 那是给数据接口用的；登录页是普通表单页，实测某校（正方 V-9）对 XHR 头 + 错误路径
+    # 直接回 HTTP 901（空响应），而同样的请求用浏览器头会老老实实回 302/错误提示。
+    # 把值写 None 在 requests 里表示「本次请求删掉这个会话级头」。
+    LOGIN_HEADERS = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
+        "X-Requested-With": None,
+    }
+
+    # 登录表单里这些名字由我们自己填（用户名/加密后的密码/验证码/csrf），
+    # 不能从页面上回抄 —— 免得把页面里的空值发上去顶掉正确的值。
+    _FORM_SKIP = frozenset({"yhm", "mm", "yzm", "csrftoken", "csrf_token"})
+
+    # ------------------------------------------------------------------ #
+    # 应用前缀（app_prefix）
+    # ------------------------------------------------------------------ #
+    # 上面所有端点都按新正方的默认部署写成 `/jwglxt/...`，但**不是每所学校都挂在
+    # `/jwglxt` 下**：有的学校直接把教务系统挂在站点根目录，登录页是
+    # `https://jwxt.example.edu.cn/xtgl/login_slogin.html`（没有 /jwglxt）。
+    # 这种部署下请求 `/jwglxt/xtgl/login_getPublicKey.html` 会返回**登录页 HTML**
+    # 而不是公钥 JSON —— 旧版本在这里直接判定「公钥解析失败」，表现就是「登录不了」。
+    # 真正发请求时统一由 `_url()` 把开头那段 `/jwglxt` 换成探测到的前缀。
+    APP_PREFIX = "/jwglxt"
+    # 探测顺序：先试 /jwglxt，再试根目录
+    APP_PREFIX_CANDIDATES = ("/jwglxt", "")
+    PUBLIC_KEY_SUFFIX = "/xtgl/login_getPublicKey.html"
+    # 地址里出现这些片段，说明用户粘贴的是「某个页面地址」而不是站点根地址，
+    # 片段之前的那一段就是应用前缀（例如 /jwglxt/xtgl/... → 前缀 /jwglxt）。
+    ROUTE_MARKERS = ("/xtgl/", "/xsxk/", "/zftal-ui", "/jsxsd/", "/pwdmgr/")
+
     # 这些是本软件自己的配置项，**不是**教务协议的字段，绝不能混进请求体。
     # （`_search_body` 第二层会转发配置文件里用户手写的协议字段，所以必须显式
     # 排除自己的键；实测以前提交体里混进了 bad_keys / smtp_host / notify_*
     # 等二十多个垃圾字段。）
     NON_PROTOCOL_KEYS = frozenset({
-        "base_url", "username", "password", "remember_password",
+        "base_url", "app_prefix", "app_prefix_for", "username", "password", "remember_password",
         "poll_interval", "monitor_interval", "request_timeout", "max_retries",
         "max_attempts_per_round", "concurrent_submit", "start_time",
         "stop_when_all_done", "submit_even_if_full",
@@ -130,12 +174,34 @@ class JwglxtClient:
     # 不属于业务参数（pageNumber 是该 HTML 页面自己的分页状态，跟搜索窗口无关）。
     PAGE_LEVEL_KEYS = ("localeKey", "cdTsxx", "pageNumber")
 
-    def __init__(self, cfg: Dict[str, Any], logger=None, config_path: str | None = None):
+    def __init__(self, cfg: Dict[str, Any], logger=None, config_path: str | None = None,
+                 on_prefix: Optional[Callable[[str], None]] = None):
         self.cfg = cfg
         self.log = logger or (lambda msg, level="info": None)
+        # 探测到应用前缀后回调（GUI 用它把值回填到输入框，避免下次保存配置时把它抹掉）
+        self.on_prefix = on_prefix
         # 配置路径：探测到「会让服务端报错的字段」后写回，避免每次启动都重探一遍
         self.config_path = config_path
-        self.base_url = (cfg.get("base_url") or "").rstrip("/")
+        self.base_url, self._prefix_hint = self.normalize_base_url(cfg.get("base_url") or "")
+        # 注意：**不能**用 `cfg.get(...) or "auto"` —— 空串是合法取值（挂在根目录），
+        # 用 or 会把「明确指定根目录」当成「没配置」。只有键缺失/None 才算 auto。
+        raw_prefix = cfg.get("app_prefix")
+        configured_prefix = "auto" if raw_prefix is None else str(raw_prefix).strip()
+        # 前缀是「相对某个域名」才成立的：换学校/换域名后旧前缀必须作废，
+        # 否则用户改了 base_url 却保留着上一个学校的 /jwglxt，又会登录不了。
+        remembered_for = str(cfg.get("app_prefix_for") or "").strip()
+        if remembered_for and remembered_for != self.base_url:
+            configured_prefix = "auto"
+        # 取值语义见 config.py：auto=探测；""=明确挂在根目录；"/xxx"=明确指定。
+        # 注意空串是**合法且需要锁定**的前缀，所以不能用「是否为空」判断要不要探测。
+        stripped = configured_prefix.strip("/")
+        if configured_prefix.lower() == "auto":
+            self._prefix_locked = False
+            self.app_prefix = self.APP_PREFIX
+        else:
+            self._prefix_locked = True
+            self.app_prefix = ("/" + stripped) if stripped else ""
+        self._prefix_detected = False
         self.username = (cfg.get("username") or "").strip()
         self.password = cfg.get("password") or ""
         self.timeout = float(cfg.get("request_timeout") or 8)
@@ -187,7 +253,169 @@ class JwglxtClient:
     def _url(self, path: str) -> str:
         if path.startswith("http"):
             return path
+        # 端点常量统一按 /jwglxt 写，这里换成实际探测到的前缀：
+        #   app_prefix="/jwglxt"（默认）→ 原样；=""（根目录）→ 去掉 /jwglxt 那一段。
+        if path.startswith(self.APP_PREFIX):
+            path = (self.app_prefix or "") + path[len(self.APP_PREFIX):]
         return self.base_url + path
+
+    def _prefix_candidates(self, respect_lock: bool = True) -> List[str]:
+        """按优先级列出要试的前缀。
+
+        `respect_lock=True`（默认）：用户手工配过就只试它（尊重配置，不再乱猜）。
+        `respect_lock=False`：自救路径专用 —— **锁着也把候选都试一遍**，否则历史遗留的
+        错误前缀永远没有机会被纠正。
+        """
+        if respect_lock and self._prefix_locked:
+            return [self.app_prefix]
+        out: List[str] = []
+        for cand in (self._prefix_hint, *self.APP_PREFIX_CANDIDATES):
+            cand = (cand or "").rstrip("/")
+            if cand not in out:
+                out.append(cand)
+        return out
+
+    @staticmethod
+    def normalize_base_url(raw: str) -> Tuple[str, str]:
+        """把用户填的地址拆成 `(站点根地址, 前缀提示)`。
+
+        用户经常直接把浏览器地址栏整条粘进来，例如
+        `https://jwxt.example.edu.cn/xtgl/login_slogin.html`；也有人只填到子目录
+        `https://host/jwglxt`。不拆干净的话，拼出来的地址会变成
+        `.../xtgl/login_slogin.html/jwglxt/xtgl/login_getPublicKey.html` 这种四不像，
+        服务端通常回一个登录页 HTML，最后表现成「登录不了」。
+        """
+        url = (raw or "").strip()
+        if not url:
+            return "", ""
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        parts = urlsplit(url)
+        if not parts.netloc:
+            return url.rstrip("/"), ""
+        path = (parts.path or "").rstrip("/")
+        # 默认把整段路径当前缀（/jwglxt、/jwxt 都是这种形态）；
+        # 一旦发现它其实是个页面地址，就只取页面之前的那一段。
+        prefix = path
+        for marker in JwglxtClient.ROUTE_MARKERS:
+            idx = path.find(marker)
+            if idx >= 0:
+                prefix = path[:idx].rstrip("/")
+                break
+        base = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        return base.rstrip("/"), prefix
+
+    def _probe_prefixes(self) -> Tuple[Optional[str], List[str]]:
+        """按候选顺序探测应用前缀，**不看 `_prefix_locked`**（自救路径要用）。
+
+        返回 `(命中的前缀 或 None, 尝试记录)`。判据取公钥接口回 JSON（含 modulus）：
+        错路径不会 404，而是回 200 + 登录页 HTML，只看状态码会把错前缀也当命中。
+        """
+        tried: List[str] = []
+        for cand in self._prefix_candidates(respect_lock=False):
+            suffix = cand + self.PUBLIC_KEY_SUFFIX
+            try:
+                resp = self._request("GET", suffix, retry=False)
+            except JwglxtError as exc:
+                tried.append(f"{cand or '/'}（{exc}）")
+                continue
+            if resp.status_code == 200 and '"modulus"' in resp.text.replace(" ", ""):
+                return cand, tried
+            tried.append(f"{cand or '/'}（HTTP {resp.status_code}，返回的不是公钥 JSON）")
+        return None, tried
+
+    def detect_app_prefix(self, force: bool = False) -> str:
+        """探测教务系统挂在哪个路径前缀下，结果写回 config.json。
+
+        判据特意选**公钥接口**而不是登录页：不少部署对不存在的路径一律回登录页 HTML
+        （HTTP 200 + `<!doctype html>`），拿登录页当判据会把错误前缀也当成命中；
+        公钥接口只会回 JSON（里面有 `modulus`），一测就准。
+        """
+        if self._prefix_detected and not force:
+            return self.app_prefix
+        if self._prefix_locked:
+            self._prefix_detected = True
+            return self.app_prefix
+
+        found, tried = self._probe_prefixes()
+        if found is not None:
+            self.app_prefix = found
+            self._prefix_detected = True
+            self.log("info", f"教务系统应用前缀：{found or '（根目录，无 /jwglxt）'}")
+            self._remember_app_prefix()
+            self._notify_prefix()
+            return self.app_prefix
+        self.log(
+            "warn",
+            "没能确认教务系统前缀，暂按默认值继续；已尝试：" + "；".join(tried),
+        )
+        self.app_prefix = self._prefix_hint or self.APP_PREFIX
+        self._prefix_detected = True
+        # 故意**不**调 _notify_prefix()：探测失败时回填给界面的只是猜测值，
+        # 用户一看输入框里是 /jwglxt 就点保存，反而把这个错值永久锁进配置
+        # （历史上就是这么来的）。宁可让输入框保持 auto，下次登录再探。
+        return self.app_prefix
+
+    def _notify_prefix(self) -> None:
+        if not self.on_prefix:
+            return
+        try:
+            self.on_prefix(self.app_prefix)
+        except Exception:  # noqa: BLE001  回调不能影响登录流程
+            pass
+
+    def ensure_app_prefix(self) -> str:
+        """登录等流程开始前调用：确保前缀已探测。"""
+        if not self._prefix_detected:
+            self.detect_app_prefix()
+        return self.app_prefix
+
+    def recover_app_prefix(self, reason: str = "") -> Optional[str]:
+        """登录被退回登录页时的自救：**无视手工锁**重新探测前缀。
+
+        命中了、且与当前值不同 → 立即改用新前缀并写回 config.json，返回新前缀；
+        否则返回 None（调用方应按原错误处理，不要无脑重试）。
+        """
+        old = self.app_prefix
+        found, tried = self._probe_prefixes()
+        if found is None:
+            self.log("debug", "重新探测应用前缀失败；已尝试：" + "；".join(tried))
+            return None
+        if found == old:
+            self.log("debug", f"重新探测应用前缀仍是 {found or '（根目录）'}，判定不是前缀问题。")
+            return None
+        self.app_prefix = found
+        self._prefix_locked = False
+        self._prefix_detected = True
+        self.log(
+            "warn",
+            f"{reason or '请求被退回登录页'} → 应用前缀已自动更正为 "
+            f"{found or '（根目录）'}（原为 {old or '（根目录）'}），正在重试一次。",
+        )
+        self._remember_app_prefix()
+        self._notify_prefix()
+        return found
+
+    def _remember_app_prefix(self) -> None:
+        """把探测到的前缀写回配置文件，避免每次启动都重探。"""
+        try:
+            self.cfg["app_prefix"] = self.app_prefix
+        except Exception:  # noqa: BLE001
+            pass
+        if not self.config_path:
+            return
+        try:
+            from config import load_config, save_config  # 延迟导入，避免循环依赖
+            fresh = load_config(self.config_path)
+            if (str(fresh.get("app_prefix") or "") == self.app_prefix
+                    and str(fresh.get("app_prefix_for") or "") == self.base_url):
+                return
+            fresh["app_prefix"] = self.app_prefix
+            # 记下这个前缀是给哪个域名探出来的（换域名后自动作废）
+            fresh["app_prefix_for"] = self.base_url
+            save_config(fresh, self.config_path)
+        except Exception as exc:  # noqa: BLE001
+            self.log("debug", f"写入 app_prefix 失败：{exc}")
 
     def _request(self, method: str, path: str, *, retry: bool = True, **kw) -> requests.Response:
         url = self._url(path)
@@ -229,10 +457,22 @@ class JwglxtClient:
 
     def fetch_public_key(self) -> Tuple[str, str]:
         """获取 RSA 公钥的 (modulus, exponent)，均为 base64 字符串。"""
-        resp = self._request("GET", self.PUBLIC_KEY)
+        resp = self._request("GET", self.PUBLIC_KEY, retry=False, headers=self.LOGIN_HEADERS)
         if resp.status_code != 200:
+            if resp.status_code in (901, 903):
+                raise PrefixMismatch(
+                    f"公钥接口被网关拒绝（HTTP {resp.status_code}），教务系统路径前缀可能不对。"
+                )
             raise JwglxtError(f"获取公钥失败，HTTP {resp.status_code}")
         text = resp.text.strip()
+        # 关键判据：拿到网页说明**路径不对**（前缀猜错了）。不少部署对不存在的路径
+        # 一律回登录页 HTML，如果不拦这一手，下面会把 HTML 里的长串误认成公钥，
+        # 最后报一个看不懂的「密码加密失败 / 登录失败」。
+        if text[:64].lstrip().lower().startswith(("<!doctype", "<html")):
+            raise PrefixMismatch(
+                "公钥接口返回的是网页而不是 JSON，说明教务系统地址或应用前缀不对"
+                f"（当前前缀：{self.app_prefix or '（根目录）'}）。"
+            )
         try:
             # 标准返回：time 字段 + modulus + exponent
             data = json.loads(text)
@@ -249,81 +489,262 @@ class JwglxtClient:
         return str(modulus), str(exponent)
 
     def login(self) -> bool:
-        """完整登录流程。成功返回 True，失败抛 LoginError。"""
+        """完整登录流程。成功返回 True，失败抛 LoginError。
+
+        前缀猜错时（典型场景：老配置里手工写过 `app_prefix=/jwglxt`，而学校其实
+        挂在根目录）服务端会把请求退回登录页，这里会自动重新探测前缀并**重试一次**，
+        避免被历史配置永久卡死；重试后仍失败才把原话抛给用户。
+        """
         self._ensure_url()
         if not self.username or not self.password:
             raise LoginError("请先填写学号和密码。")
 
         with self._lock:
-            # 1) 打开登录页，拿会话 cookie 与 csrf_token
-            page = self._request("GET", self.LOGIN_PAGE)
-            if page.status_code >= 400:
-                raise LoginError(
-                    f"打开登录页失败，HTTP {page.status_code}。请检查教务系统地址与网络。"
-                )
-            csrf = self._extract_csrf(page.text)
-            if self.save_debug_html:
-                self._dump_debug("login_page.html", page.text)
-
-            self.session.headers.update({
-                "Referer": self._url(self.LOGIN_PAGE),
-                "Origin": self.base_url,
-                "Content-Type": "application/x-www-form-urlencoded",
-            })
-
-            # 2) 公钥 + 加密密码
-            modulus, exponent = self.fetch_public_key()
+            # 0) 先确认教务系统挂在哪个前缀下（/jwglxt 还是根目录）
+            self.ensure_app_prefix()
+            # 把「到底在登哪个地址、哪个学号、哪个前缀」先记一行日志：
+            # 远程排障时用户只要把这一行发过来，就不用再猜他填了什么。
+            self.log("info", "正在登录：{}（应用前缀 {}），学号 {}".format(
+                self.base_url, self.app_prefix or "（根目录，无 /jwglxt）",
+                self.username))
             try:
-                mm = rsa_encrypt_password(self.password, modulus, exponent)
-            except (ValueError, binascii.Error) as exc:
-                raise LoginError(f"密码加密失败：{exc}") from exc
+                return self._login_once()
+            except PrefixMismatch as first:
+                # 注意：更正后的前缀可能是**空串**（学校挂在根目录），所以这里必须
+                # 用 `is None` 判断，写成 `if not recover(...)` 会把成功当失败。
+                if self.recover_app_prefix(str(first)) is None:
+                    raise LoginError(str(first)) from first
+                try:
+                    return self._login_once()
+                except PrefixMismatch as second:
+                    raise LoginError(str(second)) from second
 
-            payload = {
-                "yhm": self.username,
-                "mm": mm,
-                "language": "zh_CN",
-            }
-            if csrf:
-                payload["csrf_token"] = csrf
-                payload["csrftoken"] = csrf  # 两种字段名都带上，兼容魔改
+    @classmethod
+    def _extract_form_hidden(cls, html: str) -> Dict[str, str]:
+        """抄下登录表单里除用户名/密码/验证码/csrf 之外的所有 input 值。
 
-            # 3) 提交登录（禁止自动跳转，便于判断结果）
-            resp = self._request(
-                "POST", self.LOGIN_POST, data=payload, allow_redirects=False, retry=False
+        不同学校会在登录页塞一堆策略开关（`mmsfjm` 密码是否加密、`yzcskz` 输错
+        几次要验证码、`xxdm` 学校代码、`dxsyrz` 是否短信验证…），而浏览器走的是
+        `document.forms[0].submit()`，**整张表单一起发**。实测只发
+        yhm/mm/language 也能登上，但把页面给的字段原样回传最接近浏览器行为，
+        遇到严格校验的部署才不会莫名被拒。只回抄页面里已存在且非空的值。
+        """
+        form = re.search(r"<form[^>]*>(.*?)</form>", html, re.S | re.I)
+        chunk = form.group(1) if form else html
+        out: Dict[str, str] = {}
+        for m in re.finditer(r"<input\b([^>]*)>", chunk, re.I):
+            attrs = m.group(1)
+            name = re.search(r'name\s*=\s*"([^"]+)"', attrs, re.I)
+            if not name:
+                continue
+            key = name.group(1)
+            if key in cls._FORM_SKIP or key in out:
+                continue
+            itype = re.search(r'type\s*=\s*"([^"]+)"', attrs, re.I)
+            if itype and itype.group(1).lower() in (
+                "submit", "button", "reset", "checkbox", "radio", "file", "image"
+            ):
+                continue
+            value = re.search(r'value\s*=\s*"([^"]*)"', attrs, re.I) or re.search(
+                r"value\s*=\s*([^\s>]+)", attrs, re.I)
+            if value:
+                val = value.group(1).strip()
+                if val:
+                    out[key] = val
+        return out
+
+    def _prefix_ok(self) -> bool:
+        """当前前缀下公钥接口是否**真的**能拿到 JSON。
+
+        用来把「前缀不对」和「登录被拒绝」分开：服务端把 POST 退回登录页，既可能是
+        前缀写错，也可能是账号/密码/验证码被拒。公钥接口能拿到 JSON 就证明前缀没问题，
+        这时**绝不能再把锅甩给前缀** —— 否则用户会照着「前缀不对」白改半天配置。
+        """
+        try:
+            resp = self._request("GET", self.PUBLIC_KEY, retry=False,
+                                 headers=self.LOGIN_HEADERS)
+        except JwglxtError:
+            return False
+        if resp.status_code != 200:
+            return False
+        return '"modulus"' in resp.text.replace(" ", "")
+
+    def _describe_login_rejection(self, tip: str, page_html: str = "") -> str:
+        """把「登录被服务端拒绝」翻成人能照着做的提示（不甩锅给前缀）。"""
+        parts: List[str] = []
+        if tip:
+            parts.append(f"教务系统返回：{tip}")
+        flat = (page_html or "").replace(" ", "")
+        needs_captcha = bool(
+            re.search(r'dlsfbxyzm"?\s*value=1', flat)
+            or re.search(r'name="yzm"', flat)
+            or "验证码" in flat
+        )
+        if needs_captcha:
+            parts.append(
+                "服务端这次要求输入验证码（连续输错密码后常会触发），本工具无法自动填验证码，"
+                "请先在浏览器里登录一次，或换个时间再试。"
+            )
+        # 把「当前到底在用哪个地址、哪个学号」摆出来 —— 换学校后忘了改账号，
+        # 或者 base_url 还是老学校的，一眼就能看出来。
+        parts.append(
+            f"当前使用的地址：{self.base_url}；学号：{self.username or '（空）'}。"
+        )
+        parts.append(
+            "已确认教务系统地址与应用前缀是对的，问题出在这次登录本身："
+            "学号/密码不对、账号被锁定或未激活、需要验证码或统一身份认证。"
+            "如果你刚换学校，请把学号与密码改成新学校的（旧学校的账号在新教务系统上登不进去）。"
+        )
+        return " ".join(parts)
+
+    def _login_once(self) -> bool:
+        """真正的一次登录往返（调用方须持有 `self._lock`）。"""
+        # 1) 打开登录页，拿会话 cookie 与 csrf_token
+        page = self._request(
+            "GET", self.LOGIN_PAGE, retry=False, headers=self.LOGIN_HEADERS
+        )
+        if page.status_code >= 400:
+            raise LoginError(
+                f"打开登录页失败，HTTP {page.status_code}。请检查教务系统地址与网络。"
+            )
+        csrf = self._extract_csrf(page.text)
+        if self.save_debug_html:
+            self._dump_debug("login_page.html", page.text)
+
+        self.session.headers.update({
+            "Referer": self._url(self.LOGIN_PAGE),
+            "Origin": self.base_url,
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+
+        # 2) 公钥 + 加密密码
+        modulus, exponent = self.fetch_public_key()
+        try:
+            mm = rsa_encrypt_password(self.password, modulus, exponent)
+        except (ValueError, binascii.Error) as exc:
+            raise LoginError(f"密码加密失败：{exc}") from exc
+
+        payload = self._extract_form_hidden(page.text)
+        payload.update({
+            "yhm": self.username,
+            "mm": mm,
+            "language": "zh_CN",
+        })
+        if csrf:
+            payload["csrf_token"] = csrf
+            payload["csrftoken"] = csrf  # 两种字段名都带上，兼容魔改
+
+        # 3) 提交登录（禁止自动跳转，便于判断结果）
+        resp = self._request(
+            "POST", self.LOGIN_POST, data=payload, allow_redirects=False, retry=False,
+            headers=self.LOGIN_HEADERS,
+        )
+
+        location = resp.headers.get("Location", "") or ""
+        ok = resp.status_code in (301, 302, 303, 307, 308)
+
+        # 网关拒绝（901/903，空响应）：错前缀下很常见，交给上层重新探测后重试一次。
+        # 但若公钥接口在**当前**前缀下能拿到 JSON，就说明前缀没错，别再让用户改配置。
+        if resp.status_code in (901, 903):
+            if self._prefix_ok():
+                raise LoginError(
+                    f"登录请求被服务端网关拒绝（HTTP {resp.status_code}），"
+                    "但教务系统地址与应用前缀是对的。多为请求被 WAF/防火墙拦截，"
+                    "请稍后重试；若一直如此，请把本程序加入杀毒软件信任区。"
+                )
+            raise PrefixMismatch(
+                f"登录请求被服务端网关拒绝（HTTP {resp.status_code}），"
+                "通常是教务系统路径前缀不对。"
             )
 
-            location = resp.headers.get("Location", "") or ""
-            ok = resp.status_code in (301, 302, 303, 307, 308)
-            if not ok:
-                # 有些部署直接 200 + 主界面，或 200 + 错误提示
-                if "index_initMenu" in resp.text or "index_gnmkdm" in resp.text:
-                    ok = True
-                else:
-                    tip = self._login_error_message(resp.text)
-                    raise LoginError(tip or f"登录失败，HTTP {resp.status_code}")
+        # ⚠️ 但「302 回登录页」**不等于**「登录失败」，更不等于「前缀不对」：
+        #   · 有的部署（实测某校 jw1.*）**登录成功**也是先 302 回
+        #     /xtgl/login_slogin.html，再由它跳到 index_initMenu.html —— 只看
+        #     「Location 里有 login_slogin」会把自己的成功判成失败，
+        #     再顺手报一句「学号或密码不正确」，用户怎么试都「登不上」；
+        #   · 账号/密码错、账号被锁、要验证码时，服务端也可能这么回。
+        # 所以判据只能是**跟着跳转走到底，看最终落在哪一页**。
+        if ok and "login_slogin" in location.lower():
+            back_html = ""
+            final_url = ""
+            try:
+                back = self._request("GET", location, retry=False,
+                                     headers=self.LOGIN_HEADERS, allow_redirects=True)
+                back_html = back.text
+                final_url = str(back.url)
+            except JwglxtError:
+                pass
+            landed_on_index = (
+                "index_initMenu" in final_url
+                or "index_gnmkdm" in final_url
+                or "index_initMenu" in back_html
+                or "index_gnmkdm" in back_html
+            )
+            if landed_on_index:
+                # 登录其实成功了：登录页把我们转发到了主菜单，继续走第 4 步。
+                self.log("info", "登录成功（服务端先跳回登录页再转发到主菜单）")
+            else:
+                tip = self._login_error_message(back_html) or ""
+                if self._prefix_ok():
+                    raise LoginError(self._describe_login_rejection(tip, back_html))
+                raise PrefixMismatch(
+                    tip or "服务器把请求退回了登录页（教务系统路径前缀不对，或学号/密码有误）。"
+                )
 
-            if "login_slogin" in location and "error" in location.lower():
-                raise LoginError("学号或密码错误（服务器要求重新登录）。")
+        if not ok:
+            # 有些部署直接 200 + 主界面，或 200 + 错误提示
+            if "index_initMenu" in resp.text or "index_gnmkdm" in resp.text:
+                ok = True
+            else:
+                tip = self._login_error_message(resp.text)
+                raise LoginError(tip or f"登录失败，HTTP {resp.status_code}")
 
-            # 4) 落地到主页确认会话有效
-            check = self._request("GET", self.INDEX, allow_redirects=True)
-            final_url = str(check.url)
-            if "login_slogin" in final_url:
-                raise LoginError("登录未通过：被重定向回登录页，请检查学号/密码。")
+        # 4) 落地到主页确认会话有效
+        check = self._request("GET", self.INDEX, allow_redirects=True)
+        final_url = str(check.url)
+        if "login_slogin" in final_url:
+            if self._prefix_ok():
+                raise LoginError(self._describe_login_rejection("", check.text))
+            raise PrefixMismatch("登录未通过：被重定向回登录页（请检查学号/密码或教务系统地址）。")
 
-            self.logged_in = True
-            self.su = self.detect_su(check.text) or self.username
-            self.log("info", f"登录成功，学号 {self.su}")
-            return True
+        # 跳到别的域名上去了 —— 多半是统一身份认证（SSO/CAS），
+        # 这种部署不是「输学号密码」就能进的，不能当成登录成功。
+        base_netloc = urlsplit(self.base_url).netloc
+        final_netloc = urlsplit(final_url).netloc
+        if final_netloc and base_netloc and final_netloc != base_netloc:
+            raise LoginError(
+                f"登录后被跳转到另一个站点：{final_url[:120]}"
+                "这通常是学校的统一身份认证（SSO/CAS）。本工具目前只支持"
+                "「直接在教务系统页面上输学号 + 密码」的部署。"
+            )
+
+        self.logged_in = True
+        self.su = self.detect_su(check.text) or self.username
+        self.log("info", f"登录成功，学号 {self.su}")
+        return True
 
     @staticmethod
     def _login_error_message(html: str) -> Optional[str]:
-        m = re.search(
-            r'id="message"[^>]*>([^<]+)<|class="[^"]*alert[^"]*"[^>]*>\s*([^<]+)<',
-            html, re.I,
-        )
-        if m:
-            return (m.group(1) or m.group(2) or "").strip()
+        """从登录失败页里抠出服务端原话。
+
+        实测某校（正方 V-9）失败时回的是 200 + 登录页，多出来的只有一段
+        `<p id="tips" class="bg_danger sl_danger">…用户名或密码不正确，请重新输入！`；
+        老版本只认 `id="message"` / `class="alert…"`，抠不到就退化成
+        「登录失败，HTTP 200」这种读者看不懂的提示。
+        """
+        patterns = [
+            r'id="tips"[^>]*>(.*?)</p>',
+            r'id="message"[^>]*>(.*?)</(?:p|div|span)>',
+            r'class="[^"]*(?:bg_danger|sl_danger|alert-danger|alert)[^"]*"[^>]*>(.*?)</(?:p|div|span)>',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.I | re.S)
+            if not m:
+                continue
+            text = re.sub(r"<[^>]+>", " ", m.group(1))
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                return text
         if "验证码" in html:
             return "登录失败：系统要求输入验证码（连续输错密码会触发）。请用浏览器登录一次，或清空 cookie 后重试。"
         return None

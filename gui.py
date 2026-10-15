@@ -20,16 +20,16 @@ import tkinter as tk
 import traceback
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import Config, app_dir
 from engine import Course, GrabEngine, Wishlist
-from jwglxt import JwglxtClient, JwglxtError, LoginError
+from jwglxt import JwglxtClient, JwglxtError, LoginError, SessionExpired
 from notifier import Notifier
 
-APP_TITLE = "正方教务抢课助手 v1.2"
+APP_TITLE = "正方教务抢课助手 v1.3.0"
 POLL_MS = 150
-VERSION_LABEL = "v1.2"
+VERSION_LABEL = "v1.3.0"
 
 # ------------------------------------------------------------------ #
 # 配色：现代浅色 · 卡片式
@@ -70,6 +70,12 @@ class GrabberApp:
         self.engine: Optional[GrabEngine] = None
         self._enriching = False
         self._closing = False
+        # 复用的登录会话：只要配置没改，就一直用同一个客户端（同一套 cookie），
+        # 搜索 / 补全 / 刷新余量都不必重新登录。
+        self._client: Optional[JwglxtClient] = None
+        self._client_sig: Optional[Tuple[str, str, str, str]] = None
+        self._client_lock = threading.RLock()
+        self._session_announced = False
 
         self.status_var = tk.StringVar(value="就绪")
         self.search_status_var = tk.StringVar(value="")
@@ -291,12 +297,16 @@ class GrabberApp:
         acc = self._card(f, "账号与系统地址")
         acc.pack(fill="x")
         self._entry_row(acc, 0, "教务系统地址", "base_url", width=52,
-                        hint="例如 https://jwglxt.xxx.edu.cn（末尾不要 /）")
+                        hint="填域名即可，如 https://jwglxt.xxx.edu.cn；"
+                             "也可以直接粘贴浏览器里的选课/登录页链接，程序会自动取域名")
         self._entry_row(acc, 1, "学号", "username")
         self._entry_row(acc, 2, "密码", "password", show="*")
+        self._entry_row(acc, 3, "应用前缀 app_prefix", "app_prefix", width=16,
+                        hint="auto=自动探测（默认）；留空=挂在根目录；"
+                             "多数新正方填 /jwglxt。探测成功后会自动写回这里")
 
         btns = ttk.Frame(acc, style="Card.TFrame")
-        btns.grid(row=3, column=1, sticky="w", pady=(10, 0))
+        btns.grid(row=4, column=1, sticky="w", pady=(10, 0))
         ttk.Button(btns, text="测试登录", style="Secondary.TButton",
                    command=self.on_test_login).pack(side="left")
         ttk.Button(btns, text="一键探测选课参数", style="Secondary.TButton",
@@ -686,13 +696,83 @@ class GrabberApp:
         if self.engine:
             self.engine.cfg = self._collect_config()
 
+    def _new_client(self, cfg: Dict[str, Any]) -> JwglxtClient:
+        """统一的客户端工厂。
+
+        除了省掉重复参数，主要在探测到「应用前缀 app_prefix」时把值回填到界面输入框：
+        否则下次点「保存配置」会用界面里的空值把它覆盖掉，等于每次启动都重探一遍。
+        """
+        return JwglxtClient(
+            cfg,
+            logger=self._client_logger,
+            config_path=self.cfg.path,
+            on_prefix=lambda prefix: self.event_queue.put(("app_prefix", prefix)),
+        )
+
+    @staticmethod
+    def _client_signature(cfg: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        """决定「能不能复用上一个客户端」的配置指纹：这几项一变就必须重新登录。"""
+        return (
+            str(cfg.get("base_url") or ""),
+            str(cfg.get("username") or ""),
+            str(cfg.get("password") or ""),
+            str(cfg.get("app_prefix") or "auto"),
+        )
+
+    def _get_client(self, cfg: Dict[str, Any], *, fresh: bool = False) -> JwglxtClient:
+        """取一个客户端；配置没变就复用上次那个**已经登录过**的 Session。
+
+        以前每点一次「搜索 / 补全 / 刷新余量」都要新建客户端并重新登录，等于每次
+        都重走「登录页 → 公钥 → 提交 → 主菜单 → 选课页」五个请求：又慢，又容易
+        被服务端当成异常登录。现在只要配置没改、会话没被踢，就一直用同一套 cookie；
+        改了学号/密码/地址/前缀则会自动换成新客户端（旧会话留着也无害）。
+        """
+        sig = self._client_signature(cfg)
+        with self._client_lock:
+            if fresh or self._client is None or self._client_sig != sig:
+                self._client = self._new_client(cfg)
+                self._client_sig = sig
+                self._session_announced = False
+            return self._client
+
+    def _ensure_session(self, client: JwglxtClient) -> None:
+        """确保「已登录 + 选课页已就绪」；会话被服务端断开时自动重登一次。"""
+        already = client.logged_in
+        try:
+            client.ensure_login()
+            client.fetch_xsxk_page()
+        except SessionExpired as exc:
+            self.log_queue.put((
+                "warn", f"会话已断开（{exc}），正在用保存的账号自动重新登录…"))
+            with self._client_lock:
+                client.logged_in = False
+            client.ensure_login()
+            client.fetch_xsxk_page()
+        if already and not self._session_announced:
+            self._session_announced = True
+            self.log_queue.put((
+                "info", f"已复用登录会话（学号 {client.su}），本次操作无需重新登录。"))
+
+    def _call_session(self, client: JwglxtClient, fn):
+        """执行 fn(client)；期间会话失效就自动重登一次再执行一遍。"""
+        self._ensure_session(client)
+        try:
+            return fn(client)
+        except SessionExpired as exc:
+            self.log_queue.put((
+                "warn", f"会话已断开（{exc}），正在用保存的账号自动重新登录…"))
+            with self._client_lock:
+                client.logged_in = False
+            self._ensure_session(client)
+            return fn(client)
+
     def on_test_login(self) -> None:
         self.on_save_config()
         cfg = self._collect_config()
 
         def work():
             try:
-                client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
+                client = self._get_client(cfg, fresh=True)  # 测登录要真登一次
                 msg = client.login()
                 self.log_queue.put(("info", f"✅ 登录成功，学号 {client.su}"))
                 self.event_queue.put(("conn", f"● 已连接 · {client.su}"))
@@ -719,8 +799,8 @@ class GrabberApp:
 
         def work():
             try:
-                client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
-                client.login()
+                client = self._get_client(cfg)
+                self._ensure_session(client)
                 stage = client.check_stage()
                 if stage.get("open") is False:
                     self.log_queue.put(("warn", f"⛔ 当前不在选课时间：{stage.get('msg')}"))
@@ -741,8 +821,8 @@ class GrabberApp:
 
         def work():
             try:
-                client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
-                client.login()
+                client = self._get_client(cfg)
+                self._ensure_session(client)
                 found = client.autodetect()
                 self.log_queue.put(("info", f"探测结果：{found}"))
                 self.event_queue.put(("autodetect", found))
@@ -926,10 +1006,9 @@ class GrabberApp:
 
         def work():
             try:
-                client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
-                client.login()
-                client.fetch_xsxk_page()
-                rows = client.search_courses(keyword, kk_value)
+                client = self._get_client(cfg)
+                rows = self._call_session(
+                    client, lambda c: c.search_courses(keyword, kk_value))
                 self.event_queue.put(("search", {
                     "rows": rows,
                     "trace": list(client.search_trace),
@@ -1089,16 +1168,13 @@ class GrabberApp:
 
         def work():
             try:
-                client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
-                client.login()
-                client.fetch_xsxk_page()
+                client = self._get_client(cfg)
 
                 def progress(done, total, name):
                     self.event_queue.put(("enrich_progress", (done, total, name)))
 
-                full = client.enrich_rows(
-                    rows, on_progress=progress, should_stop=lambda: self._closing
-                )
+                full = self._call_session(client, lambda c: c.enrich_rows(
+                    rows, on_progress=progress, should_stop=lambda: self._closing))
                 self.event_queue.put(("enriched", full))
             except Exception as exc:  # noqa: BLE001
                 self.log_queue.put(("warn", f"补全教师/余量失败：{exc}"))
@@ -1161,10 +1237,10 @@ class GrabberApp:
 
         def work():
             try:
-                client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
-                client.login()
+                client = self._get_client(cfg)
+                self._ensure_session(client)
                 self.append_log("[1/4] 登录成功" if client.logged_in else "[1/4] 登录状态未知")
-                html = client.fetch_xsxk_page()
+                html = getattr(client, "_xsxk_html", "") or ""
                 self.append_log(f"[2/4] 选课页 {len(html)} 字符")
                 if client.xkkz_map:
                     for k, v in client.xkkz_map.items():
@@ -1353,10 +1429,9 @@ class GrabberApp:
         self.append_log("正在刷新余量…", "info")
 
         def work():
-            client = JwglxtClient(cfg, logger=self._client_logger, config_path=self.cfg.path)
+            client = self._get_client(cfg)
             try:
-                client.login()
-                client.fetch_xsxk_page()
+                self._ensure_session(client)
             except Exception as exc:  # noqa: BLE001
                 self.log_queue.put(("error", f"刷新失败：{exc}"))
                 return
@@ -1522,6 +1597,19 @@ class GrabberApp:
             return
         if kind == "conn":
             self.header_status.configure(text=str(payload), fg="#34d399")
+            return
+        if kind == "app_prefix":
+            var = self.var_cache.get("app_prefix")
+            if var is not None and payload is not None:
+                # 一律回填：这个事件只在「真的探测过」时发出（值为 auto 或空），或者
+                # 登录被退回登录页后**自动更正**过前缀。后者如果不回填，界面还显示旧的
+                # 错前缀，用户一点「保存配置」就又把错的写回去了。
+                if str(var.get()).strip() != str(payload).strip():
+                    var.set(str(payload))
+                    self.append_log(
+                        f"教务系统应用前缀已更新为：{payload or '（根目录，无 /jwglxt）'}",
+                        "info",
+                    )
             return
         if kind == "need_xkkz":
             self._prompt_xkkz_then_retry()
