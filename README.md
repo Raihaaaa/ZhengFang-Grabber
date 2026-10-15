@@ -475,5 +475,5 @@ zhengfang-grabber/
 
 ---
 
-## 本软件仅供交流学习，有bug请提交issus或者通过邮箱peo67i@163.com反馈
+## 本软件仅供交流学习，有bug请提交issues或者通过邮箱peo67i@163.com反馈
 ## 如果你觉得好用，请给我点个star,这对我很有帮助，谢谢！
