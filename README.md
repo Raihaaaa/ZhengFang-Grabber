@@ -78,11 +78,6 @@ python build.py
 > 少数安全软件（实测火绒）会拦这一步并报
 > `Could not create the temporary directory`。遇到就换成**文件夹版**
 > （整个文件夹一起拷贝，直接双击里面的 exe），或把 exe 加入信任区。
-
-> **发布包不入库**：`dist/`（单文件 exe、文件夹版与 zip）已在 `.gitignore`
-> 中排除，仓库只保留源码。需要分发时在本地执行 `python build.py`，
-> 再把产物作为 GitHub Release 的附件上传即可。
->
 > `build.py` 会固定 `PYTHONHASHSEED=0` 并在失败时自动重试 3 次。PyInstaller 的
 > 分析阶段对模块遍历顺序敏感，放任哈希随机时同一个命令会**时好时坏**
 > （实测报过 `TypeError`、`SystemError: Unmatched paren in format`、
@@ -145,7 +140,7 @@ python tests/live_check.py
 
 ## 使用步骤
 **先装依赖！！！**
-pip install -r requirements.txt
+`pip install -r requirements.txt`
 1. **系统配置** 页填写：
    - `教务系统地址`：填域名即可，如 `https://jwglxt.yourschool.edu.cn`（**末尾不要带斜杠**）。
      **也可以直接把浏览器地址栏里的登录页/选课页链接整条粘进来**，程序会自动取域名，
